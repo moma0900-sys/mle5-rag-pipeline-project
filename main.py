@@ -23,6 +23,7 @@ from generate_answer import generate_answer
 
 from railguards import filter_unsafe_hits
 
+from statistics import mean
 
 
 def main():
@@ -87,8 +88,6 @@ def main():
         )
 
         results = []
-
-    # Dein bisheriger Ablauf bleibt hier bestehen
 
         # Beispiel: question = ["Was brauche ich für die Erstattung einer doppelten Zahlung?"]
         # Model --> Tokenizing/Vektorizing (Embedding) --> question_vector = [1.0, 0.1]
@@ -184,23 +183,150 @@ def main():
             print(f"Answer:\n{answer}")
             print("-" * 60)
 
+
+        # Kennzahlen in evaluation_result.json speichern
         # Außerhalb der Schleife: alle Ergebnisse einmal speichern
+        metric_names = (
+            "recall_at_3",
+            "mrr_at_3",
+            "answer_relevance",
+            "faithfulness",
+            "decision_accuracy",
+        )
+
+        # Kennzahlen für jede einzelne Frage berechnen
+        for result in results:
+            expected_sources = set(result["expected_sources"])
+            hits = result["retrieved_hits"][:3]
+
+            recall = None
+            reciprocal_rank = None
+            relevance = None
+            faithfulness = None
+
+            # Suche und Begriffsabdeckung bei beantwortbaren Fragen prüfen
+            if not result["expected_abstain"]:
+                retrieved_sources = {
+                    hit["doc_id"]
+                    for hit in hits
+                }
+
+                recall = (
+                    len(expected_sources & retrieved_sources)
+                    / len(expected_sources)
+                )
+
+                # Kehrwert des Rangs der ersten erwarteten Quelle
+                reciprocal_rank = 0.0
+
+                for rank, hit in enumerate(hits, start=1):
+                    if hit["doc_id"] in expected_sources:
+                        reciprocal_rank = 1 / rank
+                        break
+
+                answer_text = " ".join(
+                    result["answer"].casefold().split()
+                )
+                terms = result["required_terms"]
+
+                if result["actual_abstain"]:
+                    relevance = 0.0
+                elif terms:
+                    found = sum(
+                        " ".join(term.casefold().split()) in answer_text
+                        for term in terms
+                    )
+                    relevance = found / len(terms)
+
+            # Wörtliche Unterstützung durch die ausgewählten Belege
+            if not result["actual_abstain"]:
+                allowed_passages = {
+                    f"{item['text']} [{item['doc_id']}]"
+                    for item in result["evidence"]
+                }
+
+                passages = result["answer"].split("\n\n")
+
+                supported = sum(
+                    passage in allowed_passages
+                    for passage in passages
+                )
+
+                faithfulness = supported / len(passages)
+
+            decision_correct = (
+                result["actual_abstain"] == result["expected_abstain"]
+            )
+
+            result["metrics"] = {
+                "recall_at_3": recall,
+                "mrr_at_3": reciprocal_rank,
+                "answer_relevance": relevance,
+                "faithfulness": faithfulness,
+                "decision_accuracy": int(decision_correct),
+            }
+
+        # Durchschnitt je Kennzahl berechnen
+        summary = {}
+        metric_case_counts = {}
+
+        for name in metric_names:
+            values = [
+                result["metrics"][name]
+                for result in results
+                if result["metrics"][name] is not None
+            ]
+
+            summary[name] = mean(values) if values else None
+            metric_case_counts[name] = len(values)
+
+        # Kennzahlen, Bewertungsregeln und Einzelergebnisse speichern
         report_path = Path("reports/evaluation_results.json")
         report_path.parent.mkdir(parents=True, exist_ok=True)
 
+        report = {
+            "question_set": cases_path.name,
+            "metrics": summary,
+            "metric_case_counts": metric_case_counts,
+            "metric_definitions": {
+                "recall_at_3": (
+                    "Fraction of expected document IDs found in the original "
+                    "top-3 hits; averaged over answerable questions."
+                ),
+                "mrr_at_3": (
+                    "Reciprocal rank of the first relevant chunk in the "
+                    "top-3 hits, or 0 if none is found; averaged over "
+                    "answerable questions."
+                ),
+                "answer_relevance": (
+                    "Simple proxy: fraction of required_terms found in the "
+                    "answer, ignoring case and normalizing whitespace. "
+                    "Incorrect abstentions receive a score of 0."
+                ),
+                "faithfulness": (
+                    "Fraction of answer passages whose text and citation "
+                    "exactly match a selected evidence passage; "
+                    "averaged over non-abstained answers."
+                ),
+                "decision_accuracy": (
+                    "Fraction of questions for which actual abstention "
+                    "matches expected abstention."
+                ),
+            },
+            "results": results,
+        }
+
         report_path.write_text(
             json.dumps(
-                {
-                    "question_set": cases_path.name,
-                    "results": results,
-                },
+                report,
                 ensure_ascii=False,
                 indent=2,
+                allow_nan=False,
             ),
             encoding="utf-8",
         )
 
-        print(f"Ergebnisse gespeichert: {report_path}")
+        print(f"Results of evaluation saved: {report_path}")
 
     finally:
         client.close()
